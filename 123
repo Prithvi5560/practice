@@ -1,0 +1,660 @@
+import os
+import re
+from datetime import datetime, date
+from typing import Dict, Iterable, Optional
+
+import pandas as pd
+
+import database.data_model as data_model
+from routine_engine.io_layer import IOLayer
+from routine_engine.utils.logger import setup_logger
+
+
+logger = setup_logger(__name__)
+
+qc_columns: list = (
+    list(data_model.QCColumn.model_fields.keys())
+    + list(data_model.ManualData.model_fields.keys())
+)
+
+
+def run(context: Dict) -> Dict:
+    """Salesforce Transfer Delta."""
+
+    logger.info("Starting Salesforce Transfer Delta process.")
+    IO_object = IOLayer()
+
+    global commerce_current_report_date
+    global commerce_next_report_date
+    global dental_current_report_date
+    global dental_next_report_date
+    global pcms_current_report_date
+    global pcms_next_report_date
+    global provmod_current_report_date
+    global provmod_next_report_date
+    global sales_current_report_date
+    global sales_next_report_date
+    global active_inactive_report_date
+    global transfer_report_date
+
+    properties = context.get("properties")
+    if not properties:
+        raise ValueError("Salesforce Transfer Delta: properties missing in context.")
+
+    input_path = properties.get("input_path")
+    input_files = properties.get("input_files")
+
+    if not input_path:
+        raise ValueError("Salesforce Transfer Delta: input_path missing.")
+    if not input_files:
+        raise ValueError("Salesforce Transfer Delta: input_files missing.")
+
+    required_input_files = [
+        "commerce_current_week_report",
+        "commerce_next_week_report",
+        "dental_current_week_report",
+        "dental_next_week_report",
+        "pcms_current_week_report",
+        "pcms_next_week_report",
+        "provmod_current_week_report",
+        "provmod_next_week_report",
+        "sales_current_week_report",
+        "sales_next_week_report",
+        "identity_active_report",
+        "transfer_report",
+    ]
+
+    validate_input_file_configuration(input_files, required_input_files)
+
+    configured_current_date = parse_configured_date(properties.get("current_report_date"))
+    configured_next_date = parse_configured_date(properties.get("next_report_date"))
+    configured_identity_date = parse_configured_date(
+        properties.get("active_inactive_report_date")
+    )
+    configured_transfer_date = parse_configured_date(properties.get("transfer_report_date"))
+
+    commerce_current_report_date = configured_current_date or get_date_from_filename(input_files["commerce_current_week_report"])
+    commerce_next_report_date = configured_next_date or get_date_from_filename(input_files["commerce_next_week_report"])
+    dental_current_report_date = configured_current_date or get_date_from_filename(input_files["dental_current_week_report"])
+    dental_next_report_date = configured_next_date or get_date_from_filename(input_files["dental_next_week_report"])
+    pcms_current_report_date = configured_current_date or get_date_from_filename(input_files["pcms_current_week_report"])
+    pcms_next_report_date = configured_next_date or get_date_from_filename(input_files["pcms_next_week_report"])
+    provmod_current_report_date = configured_current_date or get_date_from_filename(input_files["provmod_current_week_report"])
+    provmod_next_report_date = configured_next_date or get_date_from_filename(input_files["provmod_next_week_report"])
+    sales_current_report_date = configured_current_date or get_date_from_filename(input_files["sales_current_week_report"])
+    sales_next_report_date = configured_next_date or get_date_from_filename(input_files["sales_next_week_report"])
+    active_inactive_report_date = configured_identity_date or get_date_from_filename(input_files["identity_active_report"])
+    transfer_report_date = configured_transfer_date or get_date_from_filename(input_files["transfer_report"])
+
+    context["commerce_current_report_date"] = commerce_current_report_date
+    context["commerce_next_report_date"] = commerce_next_report_date
+    context["dental_current_report_date"] = dental_current_report_date
+    context["dental_next_report_date"] = dental_next_report_date
+    context["pcms_current_report_date"] = pcms_current_report_date
+    context["pcms_next_report_date"] = pcms_next_report_date
+    context["provmod_current_report_date"] = provmod_current_report_date
+    context["provmod_next_report_date"] = provmod_next_report_date
+    context["sales_current_report_date"] = sales_current_report_date
+    context["sales_next_report_date"] = sales_next_report_date
+    context["active_inactive_report_date"] = active_inactive_report_date
+    context["transfer_report_date"] = transfer_report_date
+
+    # Commerce Current / Next
+    curr_commerce = read_salesforce_report(
+        IO_object,
+        os.path.join(input_path, input_files["commerce_current_week_report"]),
+        "Commerce Current Week",
+        ["LANID", "LANId", "LAN ID"],
+    )
+    context["commerce"] = curr_commerce
+
+    next_commerce = read_salesforce_report(
+        IO_object,
+        os.path.join(input_path, input_files["commerce_next_week_report"]),
+        "Commerce Next Week",
+        ["LANID", "LANId", "LAN ID"],
+    )
+    context["next_commerce"] = next_commerce
+
+    # Dental Current / Next
+    curr_dental = read_salesforce_report(
+        IO_object,
+        os.path.join(input_path, input_files["dental_current_week_report"]),
+        "Dental Current Week",
+        ["LANID", "LANId", "LAN ID"],
+    )
+    context["dental"] = curr_dental
+
+    next_dental = read_salesforce_report(
+        IO_object,
+        os.path.join(input_path, input_files["dental_next_week_report"]),
+        "Dental Next Week",
+        ["LANID", "LANId", "LAN ID"],
+    )
+    context["next_dental"] = next_dental
+
+    # PCMS Current / Next
+    curr_pcms = read_salesforce_report(
+        IO_object,
+        os.path.join(input_path, input_files["pcms_current_week_report"]),
+        "PCMS Current Week",
+        ["LANID", "LANId", "LAN ID"],
+    )
+    context["pcms"] = curr_pcms
+
+    next_pcms = read_salesforce_report(
+        IO_object,
+        os.path.join(input_path, input_files["pcms_next_week_report"]),
+        "PCMS Next Week",
+        ["LANID", "LANId", "LAN ID"],
+    )
+    context["next_pcms"] = next_pcms
+
+    # ProvMod Current / Next
+    curr_provmod = read_salesforce_report(
+        IO_object,
+        os.path.join(input_path, input_files["provmod_current_week_report"]),
+        "ProvMod Current Week",
+        ["LANID", "LANId", "LAN ID"],
+    )
+    context["provmod"] = curr_provmod
+
+    next_provmod = read_salesforce_report(
+        IO_object,
+        os.path.join(input_path, input_files["provmod_next_week_report"]),
+        "ProvMod Next Week",
+        ["LANID", "LANId", "LAN ID"],
+    )
+    context["next_provmod"] = next_provmod
+
+    # Sales Current / Next
+    curr_sales = read_salesforce_report(
+        IO_object,
+        os.path.join(input_path, input_files["sales_current_week_report"]),
+        "Sales Current Week",
+        ["LANId", "LANID", "LAN ID"],
+    )
+    context["sales"] = curr_sales
+
+    next_sales = read_salesforce_report(
+        IO_object,
+        os.path.join(input_path, input_files["sales_next_week_report"]),
+        "Sales Next Week",
+        ["LANId", "LANID", "LAN ID"],
+    )
+    context["next_sales"] = next_sales
+
+    # Identity Active / Inactive
+    identity_active = IO_object.read_excel(
+        source_path=os.path.join(input_path, input_files["identity_active_report"])
+    )
+    context["identity_active"] = get_first_sheet(identity_active, "Identity Active/Inactive Report")
+    context["identity_active"].columns = [clean_column_name(c) for c in context["identity_active"].columns]
+
+    identity_lan_column = find_column(context["identity_active"], ["LAN ID", "LANID", "LANId"])
+    if identity_lan_column is None:
+        raise ValueError("Identity report LAN ID column not found.")
+
+    context["identity_active"] = rename_and_normalize_lan_id(
+        context["identity_active"], identity_lan_column
+    )
+
+    identity_status_column = find_column(context["identity_active"], ["Status"])
+    if identity_status_column and identity_status_column != "Status":
+        context["identity_active"] = context["identity_active"].rename(
+            columns={identity_status_column: "Status"}
+        )
+
+    context["identity_active"] = (
+        context["identity_active"]
+        .drop_duplicates(subset=["lan_id"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    # Transfer Report - MAIN FILE
+    transfer_data = IO_object.read_excel(
+        source_path=os.path.join(input_path, input_files["transfer_report"])
+    )
+    context["transfer"] = get_first_sheet(transfer_data, "Job Profile Transfer Report")
+    context["transfer"].columns = [clean_column_name(c) for c in context["transfer"].columns]
+
+    if "Employee LANID" not in context["transfer"].columns:
+        raise ValueError("Transfer Report required column 'Employee LANID' not found.")
+
+    context["transfer"] = rename_and_normalize_lan_id(
+        context["transfer"], "Employee LANID"
+    )
+    context["transfer"] = (
+        context["transfer"]
+        .loc[context["transfer"]["lan_id"].notna()]
+        .drop_duplicates(subset=["lan_id"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    # Identity enrichment - explicit context style
+    context["commerce"] = merge_identity(context["commerce"], context["identity_active"])
+    context["next_commerce"] = merge_identity(context["next_commerce"], context["identity_active"])
+    context["dental"] = merge_identity(context["dental"], context["identity_active"])
+    context["next_dental"] = merge_identity(context["next_dental"], context["identity_active"])
+    context["pcms"] = merge_identity(context["pcms"], context["identity_active"])
+    context["next_pcms"] = merge_identity(context["next_pcms"], context["identity_active"])
+    context["provmod"] = merge_identity(context["provmod"], context["identity_active"])
+    context["next_provmod"] = merge_identity(context["next_provmod"], context["identity_active"])
+    context["sales"] = merge_identity(context["sales"], context["identity_active"])
+    context["next_sales"] = merge_identity(context["next_sales"], context["identity_active"])
+
+    # Commerce Delta
+    context["delta_commerce"] = extract_and_merge_df(
+        context["commerce"], context["transfer"], "lan_id", "lan_id", "left",
+        "Commerce", commerce_current_report_date, commerce_next_report_date, True
+    )
+    context["delta_commerce_yes"] = context["delta_commerce"][context["delta_commerce"]["Status"] == "YES"].copy()
+    context["delta_commerce_no"] = context["delta_commerce"][context["delta_commerce"]["Status"] == "NO"].copy()
+
+    # Dental Delta
+    context["delta_dental"] = extract_and_merge_df(
+        context["dental"], context["transfer"], "lan_id", "lan_id", "left",
+        "Dental", dental_current_report_date, dental_next_report_date, True
+    )
+    context["delta_dental_yes"] = context["delta_dental"][context["delta_dental"]["Status"] == "YES"].copy()
+    context["delta_dental_no"] = context["delta_dental"][context["delta_dental"]["Status"] == "NO"].copy()
+
+    # PCMS Delta
+    context["delta_pcms"] = extract_and_merge_df(
+        context["pcms"], context["transfer"], "lan_id", "lan_id", "left",
+        "PCMS", pcms_current_report_date, pcms_next_report_date, True
+    )
+    context["delta_pcms_yes"] = context["delta_pcms"][context["delta_pcms"]["Status"] == "YES"].copy()
+    context["delta_pcms_no"] = context["delta_pcms"][context["delta_pcms"]["Status"] == "NO"].copy()
+
+    # ProvMod Delta
+    context["delta_provmod"] = extract_and_merge_df(
+        context["provmod"], context["transfer"], "lan_id", "lan_id", "left",
+        "ProvMod", provmod_current_report_date, provmod_next_report_date, True
+    )
+    context["delta_provmod_yes"] = context["delta_provmod"][context["delta_provmod"]["Status"] == "YES"].copy()
+    context["delta_provmod_no"] = context["delta_provmod"][context["delta_provmod"]["Status"] == "NO"].copy()
+
+    # Sales Delta
+    context["delta_sales"] = extract_and_merge_df(
+        context["sales"], context["transfer"], "lan_id", "lan_id", "left",
+        "Sales", sales_current_report_date, sales_next_report_date, True
+    )
+    context["delta_sales_yes"] = context["delta_sales"][context["delta_sales"]["Status"] == "YES"].copy()
+    context["delta_sales_no"] = context["delta_sales"][context["delta_sales"]["Status"] == "NO"].copy()
+
+    if properties.get("write_delta_output") or properties.get("save_delta"):
+        write_delta_output(IO_object, context, properties.get("output_path"))
+
+    logger.info("Salesforce Transfer Delta completed successfully.")
+    return context
+
+
+def read_salesforce_report(
+    io_object: IOLayer,
+    source_path: str,
+    report_name: str,
+    lan_id_candidates: Iterable[str],
+) -> pd.DataFrame:
+    workbook = io_object.read_excel(source_path=source_path, header=None)
+    raw_df = get_first_sheet(workbook, report_name)
+
+    if raw_df.empty:
+        return empty_salesforce_dataframe()
+
+    flattened_text = " ".join(
+        raw_df.fillna("").astype(str).values.flatten().tolist()
+    ).lower()
+
+    if "this attachment was removed" in flattened_text:
+        logger.warning("%s contains removed attachment placeholder.", report_name)
+        return empty_salesforce_dataframe()
+
+    header_row = detect_header_row(raw_df, lan_id_candidates)
+    if header_row is None:
+        raise ValueError(f"Unable to detect actual header row in {report_name}.")
+
+    column_names = [clean_column_name(v) for v in raw_df.iloc[header_row].tolist()]
+    df = raw_df.iloc[header_row + 1:].copy()
+    df.columns = column_names
+
+    valid_columns = [
+        c for c in df.columns
+        if c and not str(c).lower().startswith("unnamed")
+    ]
+    df = df.loc[:, valid_columns]
+    df = df.dropna(how="all").reset_index(drop=True)
+
+    lan_column = find_column(df, lan_id_candidates)
+    if lan_column is None:
+        raise ValueError(
+            f"{report_name}: LAN ID column not found. Expected one of {list(lan_id_candidates)}"
+        )
+
+    df = rename_and_normalize_lan_id(df, lan_column)
+    df = df[df["lan_id"].notna()].copy()
+
+    logger.info("%s loaded. Header row=%s Rows=%s", report_name, header_row + 1, len(df))
+    return df
+
+
+def extract_and_merge_df(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    left_on: str,
+    right_on: str,
+    join: str,
+    filesheet: str = "",
+    current_report_date=None,
+    next_report_date=None,
+    add_qc_status: bool = False,
+) -> pd.DataFrame:
+
+    left_df = left_df.copy()
+    right_df = right_df.copy()
+
+    if left_df.empty:
+        empty_df = empty_salesforce_dataframe()
+        empty_df["Status"] = pd.Series(dtype="object")
+        for column in qc_columns:
+            if column not in empty_df.columns:
+                empty_df[column] = None
+        return empty_df
+
+    validate_required_columns(left_df, [left_on], f"{filesheet} Current Week")
+    validate_required_columns(right_df, [right_on], "Transfer Report")
+
+    left_df[left_on] = normalize_identifier_series(left_df[left_on])
+    right_df[right_on] = normalize_identifier_series(right_df[right_on])
+
+    transfer_rename = {
+        column: f"transfer_{to_snake_case(column)}"
+        for column in right_df.columns
+        if column != right_on
+    }
+    right_df = right_df.rename(columns=transfer_rename)
+
+    merge_df = pd.merge(
+        left_df,
+        right_df,
+        left_on=left_on,
+        right_on=right_on,
+        how=join,
+        indicator=True,
+        validate="m:1",
+    )
+
+    if add_qc_status:
+        merge_df["Status"] = merge_df["_merge"].eq("both").map({True: "YES", False: "NO"})
+        merge_df = add_qc_columns(
+            merge_df,
+            filesheet,
+            title="Salesforce",
+            control="Transfer",
+            current_report_date=current_report_date,
+            next_report_date=next_report_date,
+        )
+        merge_df.loc[
+            merge_df["Status"].ne("YES"),
+            "provisioning_employee_deletion_date",
+        ] = pd.NaT
+
+    return merge_df
+
+
+def add_qc_columns(
+    merged_df: pd.DataFrame,
+    file_sheet: str,
+    title=None,
+    control=None,
+    current_report_date=None,
+    next_report_date=None,
+) -> pd.DataFrame:
+
+    for col in qc_columns:
+        if col in merged_df.columns:
+            continue
+
+        if col == "subapplication":
+            merged_df[col] = file_sheet
+        elif col == "title":
+            merged_df[col] = title
+        elif col == "control":
+            merged_df[col] = control
+        elif col == "month":
+            report_date = active_inactive_report_date or current_report_date or date.today()
+            merged_df[col] = report_date.strftime("%B")
+        elif col == "row_added_on_date":
+            merged_df[col] = pd.Timestamp.today().date()
+        elif col == "active_user_report_date":
+            merged_df[col] = current_report_date
+        elif col == "active_inactive_report_date":
+            merged_df[col] = active_inactive_report_date
+        elif col == "active_inactive_transfer_report_date":
+            merged_df[col] = transfer_report_date
+        elif col == "provisioning_employee_deletion_date":
+            merged_df[col] = next_report_date
+        else:
+            merged_df[col] = ""
+
+    return merged_df
+
+
+def merge_identity(active_df: pd.DataFrame, identity_df: pd.DataFrame) -> pd.DataFrame:
+    if active_df.empty or identity_df.empty:
+        return active_df.copy()
+
+    identity_columns = [
+        column for column in [
+            "lan_id", "First Name", "Last Name", "Full Name", "Associate",
+            "Employee ID", "Employee Type", "Leader Name", "Leader Employee ID",
+            "Leader Email", "End Date", "Suspension Date", "Status", "Email",
+        ] if column in identity_df.columns
+    ]
+
+    identity_subset = identity_df[identity_columns].copy()
+    rename_map = {
+        column: f"identity_{to_snake_case(column)}"
+        for column in identity_subset.columns
+        if column != "lan_id"
+    }
+    identity_subset = identity_subset.rename(columns=rename_map)
+
+    return pd.merge(
+        active_df,
+        identity_subset,
+        on="lan_id",
+        how="left",
+        validate="m:1",
+    )
+
+
+def validate_input_file_configuration(input_files: Dict, required_files: list):
+    missing_files = [key for key in required_files if not input_files.get(key)]
+    if missing_files:
+        raise ValueError(
+            f"Salesforce Transfer Delta missing input configuration: {missing_files}"
+        )
+
+
+def validate_required_columns(dataframe: pd.DataFrame, required_columns: Iterable[str], report_name: str):
+    missing_columns = [c for c in required_columns if c not in dataframe.columns]
+    if missing_columns:
+        raise ValueError(
+            f"{report_name} missing columns: {missing_columns}. Available: {list(dataframe.columns)}"
+        )
+
+
+def get_first_sheet(workbook, report_name: str) -> pd.DataFrame:
+    if workbook is None:
+        raise ValueError(f"{report_name} could not be loaded.")
+    if isinstance(workbook, pd.DataFrame):
+        return workbook.copy()
+    if not isinstance(workbook, dict) or not workbook:
+        raise ValueError(f"{report_name} does not contain readable sheets.")
+
+    first_sheet = list(workbook.keys())[0]
+    logger.info("%s using sheet: %s", report_name, first_sheet)
+    return workbook[first_sheet].copy()
+
+
+def detect_header_row(raw_df: pd.DataFrame, lan_id_candidates: Iterable[str]) -> Optional[int]:
+    lan_tokens = {normalize_header_token(c) for c in lan_id_candidates}
+    common_markers = {
+        normalize_header_token("User ID"),
+        normalize_header_token("Full Name"),
+    }
+
+    for row_index in range(min(len(raw_df), 30)):
+        row_tokens = {
+            normalize_header_token(v)
+            for v in raw_df.iloc[row_index].tolist()
+            if pd.notna(v)
+        }
+        if bool(row_tokens & lan_tokens) and bool(row_tokens & common_markers):
+            return row_index
+    return None
+
+
+def find_column(dataframe: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    normalized_columns = {
+        normalize_header_token(column): column
+        for column in dataframe.columns
+    }
+    for candidate in candidates:
+        actual = normalized_columns.get(normalize_header_token(candidate))
+        if actual is not None:
+            return actual
+    return None
+
+
+def rename_and_normalize_lan_id(dataframe: pd.DataFrame, source_column: str) -> pd.DataFrame:
+    dataframe = dataframe.copy()
+    if source_column not in dataframe.columns:
+        raise KeyError(f"LAN ID column '{source_column}' not found.")
+    if source_column != "lan_id":
+        dataframe = dataframe.rename(columns={source_column: "lan_id"})
+    dataframe["lan_id"] = normalize_identifier_series(dataframe["lan_id"])
+    return dataframe
+
+
+def normalize_identifier_series(series: pd.Series) -> pd.Series:
+    return (
+        series.astype("string")
+        .str.strip()
+        .str.lower()
+        .replace({"": pd.NA, "nan": pd.NA, "none": pd.NA})
+    )
+
+
+def clean_column_name(value) -> str:
+    if pd.isna(value):
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def normalize_header_token(value) -> str:
+    if pd.isna(value):
+        return ""
+    return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
+
+
+def to_snake_case(value) -> str:
+    text = re.sub(r"[^A-Za-z0-9]+", "_", str(value).strip())
+    return text.strip("_").lower()
+
+
+def empty_salesforce_dataframe() -> pd.DataFrame:
+    return pd.DataFrame(columns=["lan_id"])
+
+
+def parse_configured_date(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid configured report date '{value}'. Expected YYYY-MM-DD."
+        ) from exc
+
+
+def write_delta_output(
+    io_object: IOLayer,
+    context: Dict,
+    output_path: str,
+) -> None:
+    if not output_path:
+        raise ValueError(
+            "Salesforce Transfer Delta: output_path is required when output writing is enabled."
+        )
+
+    if not output_path.startswith(("s3://", "http://", "https://")):
+        output_directory = os.path.dirname(output_path)
+        if output_directory:
+            os.makedirs(output_directory, exist_ok=True)
+
+    output_data = {
+        "Identity Active-Inactive": context["identity_active"],
+        "Transfer Report": context["transfer"],
+        "Commerce Delta": context["delta_commerce"],
+        "Commerce QC": context["delta_commerce_yes"],
+        "Dental Delta": context["delta_dental"],
+        "Dental QC": context["delta_dental_yes"],
+        "PCMS Delta": context["delta_pcms"],
+        "PCMS QC": context["delta_pcms_yes"],
+        "ProvMod Delta": context["delta_provmod"],
+        "ProvMod QC": context["delta_provmod_yes"],
+        "Sales Delta": context["delta_sales"],
+        "Sales QC": context["delta_sales_yes"],
+    }
+    io_object.write_excel(destination_path=output_path, data=output_data)
+    logger.info("Salesforce Transfer Delta output written to: %s", output_path)
+
+
+def get_date_from_filename(filename: str):
+    if not filename:
+        return ""
+
+    patterns = [
+        (r"(\d{4}-\d{2}-\d{2})", "%Y-%m-%d"),
+        (r"(\d{2}-\d{2}-\d{4})", "%m-%d-%Y"),
+        (r"(\d{2}_\d{2}_\d{4})", "%m_%d_%Y"),
+        (r"(\d{8})", "%Y%m%d"),
+        (r"(\d{8})", "%m%d%Y"),
+    ]
+
+    all_matches = []
+    for pattern, fmt in patterns:
+        for match in re.finditer(pattern, str(filename)):
+            all_matches.append({
+                "start_pos": match.start(),
+                "date_str": match.group(1),
+                "fmt": fmt,
+            })
+
+    if all_matches:
+        all_matches.sort(key=lambda x: x["start_pos"])
+        for match_item in reversed(all_matches):
+            try:
+                return datetime.strptime(
+                    match_item["date_str"], match_item["fmt"]
+                ).date()
+            except ValueError:
+                continue
+
+    fallback_matches = list(
+        re.finditer(r"(\d{2})-(\d{2})(?!-\d{4})", str(filename))
+    )
+    if fallback_matches:
+        month, day = map(int, fallback_matches[-1].groups())
+        try:
+            return date(datetime.now().year, month, day)
+        except ValueError:
+            pass
+
+    return ""
